@@ -6,7 +6,8 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    # تم تغيير القيمة إلى الحد الأقصى للمستودعات العامة (35 يومًا)
+    timeout-minutes: 50400
 
     steps:
       - name: Configure Core RDP Settings

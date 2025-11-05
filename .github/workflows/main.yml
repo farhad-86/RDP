@@ -10,35 +10,37 @@ jobs:
     timeout-minutes: 50400
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Configure Core RDP Settings and Disable Timeouts
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          # Disable Network Level Authentication for easier connection
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          
+          # === إصلاح جديد: منع قطع اتصال RDP بسبب الخمول أو الوقت المحدد ===
+          # هذه الإعدادات تمنع ويندوز من قطع الجلسة تلقائيًا
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "MaxDisconnectionTime" -Value 0 -Force # 0 = unlimited
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "MaxIdleTime" -Value 0 -Force         # 0 = unlimited
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" -Name "fResetBroken" -Value 1 -Force         # Auto-reconnect on broken link
+          # ===============================================================
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # Configure Firewall
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
+          
+          # Restart the Remote Desktop service to apply all changes
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
           $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
           }
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
@@ -47,16 +49,17 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          
+          # Delete user if it exists from a previous run
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name "RDP"
+          }
+          
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -FullName "RDP User"
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
 
       - name: Install Tailscale
         run: |
@@ -69,10 +72,8 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -90,8 +91,6 @@ jobs:
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
@@ -99,7 +98,7 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection with Keep-Alive
+      - name: Maintain Connection with Auto-Heal and Keep-Alive
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
@@ -107,13 +106,39 @@ jobs:
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
           
-          # Keep runner active and maintain network connection
+          # حل نهائي: نظام شفاء ذاتي لمراقبة وإصلاح اتصال Tailscale
           while ($true) {
-              # Send a ping to a reliable address (Google DNS) every 5 minutes
-              # This prevents the connection from being marked as 'idle'
-              Write-Host "[$(Get-Date)] Sending keep-alive ping..."
-              ping -n 1 8.8.8.8 | Out-Null
+              try {
+                  # تحقق من حالة Tailscale بصيغة JSON
+                  $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+                  
+                  # إذا كانت الحالة ليست "Running"، فهناك مشكلة
+                  if ($status.BackendState -ne "Running") {
+                      Write-Host "[$(Get-Date)] Tailscale state is '$($status.BackendState)'. Attempting to heal..."
+                      
+                      # أولاً، حاول إعادة تشغيل خدمة Tailscale
+                      Write-Host "[$(Get-Date)] Restarting Tailscale service..."
+                      Restart-Service -Name "Tailscale" -Force
+                      Start-Sleep -Seconds 10
+                      
+                      # إذا لم تنجح إعادة التشغيل، حاول المصادقة مرة أخرى
+                      $statusAfterRestart = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+                      if ($statusAfterRestart.BackendState -ne "Running") {
+                          Write-Host "[$(Get-Date)] Service restart failed. Re-authenticating..."
+                          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+                          Start-Sleep -Seconds 10
+                      }
+                  } else {
+                      # إذا كان كل شيء على ما يرام، أرسل ping للحفاظ على نشاط الشبكة
+                      Write-Host "[$(Get-Date)] Tailscale is healthy. Sending keep-alive ping."
+                      ping -n 1 8.8.8.8 | Out-Null
+                  }
+              }
+              catch {
+                  Write-Host "[$(Get-Date)] An error occurred during health check: $_"
+              }
               
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300 # Sleep for 5 minutes
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate."
+              # === تم التعديل هنا ===
+              Start-Sleep -Seconds 60 # انتظر دقيقة واحدة قبل التحقق مرة أخرى
           }

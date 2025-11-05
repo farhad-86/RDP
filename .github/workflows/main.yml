@@ -6,7 +6,7 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    # تم تغيير القيمة إلى الحد الأقصى للمستودعات العامة (35 يومًا)
+    # تم تعيين المدة القصوى إلى 35 يومًا (50400 دقيقة) للمستودعات العامة
     timeout-minutes: 50400
 
     steps:
@@ -99,7 +99,7 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection
+      - name: Maintain Connection with Keep-Alive
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
@@ -107,8 +107,13 @@ jobs:
           Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
           
-          # Keep runner active indefinitely (or until manually cancelled)
+          # Keep runner active and maintain network connection
           while ($true) {
+              # Send a ping to a reliable address (Google DNS) every 5 minutes
+              # This prevents the connection from being marked as 'idle'
+              Write-Host "[$(Get-Date)] Sending keep-alive ping..."
+              ping -n 1 8.8.8.8 | Out-Null
+              
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+              Start-Sleep -Seconds 300 # Sleep for 5 minutes
           }
